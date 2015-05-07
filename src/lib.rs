@@ -145,6 +145,11 @@ extern crate log;
 #[cfg(all(test, feature = "nightly"))]
 extern crate test;
 
+#[cfg(feature = "suruga-https")]
+extern crate suruga;
+
+#[cfg(feature = "suruga-https")]
+extern crate rand;
 
 pub use mimewrapper::mime;
 pub use url::Url;

@@ -24,9 +24,15 @@ unicase = "*"
 url = "*"
 traitobject = "*"
 typeable = "*"
+rand = "*"
+
+[dependencies.suruga]
+git = "https://github.com/klutzy/suruga"
+optional = true
 
 [dev-dependencies]
 env_logger = "*"
 
 [features]
 nightly = []
+suruga-https = ["suruga"]

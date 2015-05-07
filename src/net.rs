@@ -7,10 +7,19 @@ use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 
-use openssl::ssl::{Ssl, SslStream, SslContext, SSL_VERIFY_NONE};
+#[cfg(feature = "suruga-https")] use std::sync::Mutex;
+#[cfg(feature = "suruga-https")] use rand;
+#[cfg(feature = "suruga-https")] use suruga;
+
+use openssl::ssl::{SslContext, SSL_VERIFY_NONE};
 use openssl::ssl::SslMethod::Sslv23;
-use openssl::ssl::error::StreamError as SslIoError;
 use openssl::x509::X509FileType;
+
+#[cfg(not(feature = "suruga-https"))]
+use openssl::ssl::{Ssl, SslStream};
+
+#[cfg(not(feature = "suruga-https"))]
+use openssl::ssl::error::StreamError as SslIoError;
 
 use typeable::Typeable;
 use {traitobject};
@@ -186,6 +195,8 @@ impl NetworkListener for HttpListener {
     fn accept(&mut self) -> ::Result<HttpStream> {
         match *self {
             HttpListener::Http(ref mut tcp) => Ok(HttpStream::Http(CloneTcpStream(try!(tcp.accept()).0))),
+
+            #[cfg(not(feature = "suruga-https"))]
             HttpListener::Https(ref mut tcp, ref ssl_context) => {
                 let stream = CloneTcpStream(try!(tcp.accept()).0);
                 match SslStream::new_server(&**ssl_context, stream) {
@@ -196,6 +207,9 @@ impl NetworkListener for HttpListener {
                     Err(e) => Err(e.into())
                 }
             }
+
+            #[cfg(feature = "suruga-https")]
+            HttpListener::Https(..) => panic!("hyper HTTPS server not supported with suruga"),
         }
     }
 
@@ -236,13 +250,35 @@ impl Write for CloneTcpStream {
     }
 }
 
+/// HTTP over SSL, as implemented by
+/// [suruga](https://github.com/klutzy/suruga).
+///
+/// This is EXPERIMENTAL and INSECURE! There is currently
+/// no facility for certificate verification.
+#[cfg(feature = "suruga-https")]
+pub type HttpsStream = Arc<Mutex<suruga::TlsClient<CloneTcpStream, CloneTcpStream>>>;
+
+/// Stream for HTTPS using OpenSSL.
+#[cfg(not(feature = "suruga-https"))]
+pub type HttpsStream = SslStream<CloneTcpStream>;
+
+#[cfg(feature = "suruga-https")]
+macro_rules! https_stream {
+    ($e:expr) => { $e.lock().unwrap() }
+}
+
+#[cfg(not(feature = "suruga-https"))]
+macro_rules! https_stream {
+    ($e:expr) => { $e }
+}
+
 /// A wrapper around a TcpStream.
 #[derive(Clone)]
 pub enum HttpStream {
     /// A stream over the HTTP protocol.
     Http(CloneTcpStream),
     /// A stream over the HTTP protocol, protected by SSL.
-    Https(SslStream<CloneTcpStream>),
+    Https(HttpsStream),
 }
 
 impl fmt::Debug for HttpStream {
@@ -259,7 +295,7 @@ impl Read for HttpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             HttpStream::Http(ref mut inner) => inner.read(buf),
-            HttpStream::Https(ref mut inner) => inner.read(buf)
+            HttpStream::Https(ref mut inner) => https_stream!(inner).read(buf),
         }
     }
 }
@@ -269,14 +305,14 @@ impl Write for HttpStream {
     fn write(&mut self, msg: &[u8]) -> io::Result<usize> {
         match *self {
             HttpStream::Http(ref mut inner) => inner.write(msg),
-            HttpStream::Https(ref mut inner) => inner.write(msg)
+            HttpStream::Https(ref mut inner) => https_stream!(inner).write(msg),
         }
     }
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
         match *self {
             HttpStream::Http(ref mut inner) => inner.flush(),
-            HttpStream::Https(ref mut inner) => inner.flush(),
+            HttpStream::Https(ref mut inner) => https_stream!(inner).flush(),
         }
     }
 }
@@ -286,7 +322,10 @@ impl NetworkStream for HttpStream {
     fn peer_addr(&mut self) -> io::Result<SocketAddr> {
         match *self {
             HttpStream::Http(ref mut inner) => inner.0.peer_addr(),
-            HttpStream::Https(ref mut inner) => inner.get_mut().0.peer_addr()
+            #[cfg(not(feature = "suruga-https"))]
+            HttpStream::Https(ref mut inner) => inner.get_mut().0.peer_addr(),
+            #[cfg(feature = "suruga-https")]
+            HttpStream::Https(ref mut inner) => inner.lock().unwrap().reader().0.peer_addr(),
         }
     }
 
@@ -294,7 +333,10 @@ impl NetworkStream for HttpStream {
     fn close(&mut self, how: Shutdown) -> io::Result<()> {
         match *self {
             HttpStream::Http(ref mut inner) => inner.0.shutdown(how),
-            HttpStream::Https(ref mut inner) => inner.get_mut().0.shutdown(how)
+            #[cfg(not(feature = "suruga-https"))]
+            HttpStream::Https(ref mut inner) => inner.get_mut().0.shutdown(how),
+            #[cfg(feature = "suruga-https")]
+            HttpStream::Https(ref mut inner) => inner.lock().unwrap().reader().0.shutdown(how),
         }
     }
 }
@@ -315,6 +357,7 @@ impl NetworkConnector for HttpConnector {
                 debug!("http scheme");
                 Ok(HttpStream::Http(CloneTcpStream(try!(TcpStream::connect(addr)))))
             },
+            #[cfg(not(feature = "suruga-https"))]
             "https" => {
                 debug!("https scheme");
                 let stream = CloneTcpStream(try!(TcpStream::connect(addr)));
@@ -327,6 +370,15 @@ impl NetworkConnector for HttpConnector {
                 let stream = try!(SslStream::new(&context, stream));
                 Ok(HttpStream::Https(stream))
             },
+            #[cfg(feature = "suruga-https")]
+            "https" => {
+                debug!("https scheme");
+                let stream = CloneTcpStream(try!(TcpStream::connect(addr)));
+                Ok(HttpStream::Https(Arc::new(Mutex::new({
+                    let rng = rand::OsRng::new().unwrap();
+                    suruga::TlsClient::new(stream.clone(), stream, rng).unwrap()
+                }))))
+            }
             _ => {
                 Err(io::Error::new(io::ErrorKind::InvalidInput,
                                 "Invalid scheme for Http"))
